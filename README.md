@@ -38,9 +38,15 @@ On a full prefill, FlashTopK is 1.7-3.3x faster than dense scoring + FlashInfer 
 FlashTopK needs Python 3.10+, PyTorch 2.6+, Triton 3.3+ and CuTe DSL (`nvidia-cutlass-dsl`) 4.5+. SM100 GPUs also need a CUDA 12.8+ driver.
 
 ```bash
+# Install into an existing SGLang / PyTorch environment without overriding pinned deps:
+pip install --no-deps git+https://github.com/sii-system/sii-FlashTopK.git@v0.1.0-sii2
+
+# Or from a local checkout:
 pip install -e .            # torch >= 2.6, triton >= 3.3, nvidia-cutlass-dsl >= 4.5, apache-tvm-ffi
 pip install -e .[test]      # pytest for the test suite
 ```
+
+> **Note:** This fork layers minimal, backward-compatible additions on top of `Tencent-Hunyuan/FlashTopK@090902a` (caller-owned transient `scratch`, wave-aware `adaptive_threshold`, and optional `Selector` hooks for `sii-sglang`), leaving all upstream kernels, BF16 paths, public APIs, and tests intact.
 
 ### Quick start
 

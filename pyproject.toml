@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashtopk"
-version = "0.1.0"
+version = "0.1.0+sii2"
 description = "Fast, exact, deterministic fused top-k selection for learned sparse attention"
 readme = "README.md"
 license = { text = "Apache-2.0" }
