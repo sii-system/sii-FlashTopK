@@ -12,4 +12,4 @@ from .topk import DEFAULT_CHUNK_SIZE, Info, Selector, select, supported, windows
 
 __all__ = ["DEFAULT_CHUNK_SIZE", "Info", "Selector", "ops", "select", "supported", "windows_from_cu_seqlens",
            "workspace_bytes"]
-__version__ = "0.1.0"
+__version__ = "0.1.0+sii2"

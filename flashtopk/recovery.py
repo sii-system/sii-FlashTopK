@@ -17,6 +17,7 @@ the output does not depend on which path produced it.
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 
@@ -36,6 +37,12 @@ def recovery_splits(seq_len_kv: int) -> int:
     return min(MAX_SPLITS, math.ceil(seq_len_kv / SPLIT_KEYS))
 
 
+def stage_rows(seq_len_kv: int) -> int:
+    """Rows of the staged slices' buffers (scores and indices, topk wide) a call over seq_len_kv keys takes."""
+    splits = recovery_splits(seq_len_kv)
+    return RECOVERY_ROWS * splits if splits > 1 else 0
+
+
 def dense_rows(arena_elements: int, seq_len_kv: int, num_q: int) -> int:
     """Rows whole-call recovery scores at a time in an arena of `arena_elements` floats: whole 8-row tiles."""
     rows = arena_elements // max(seq_len_kv, 1) // NEXT_N * NEXT_N
@@ -44,12 +51,17 @@ def dense_rows(arena_elements: int, seq_len_kv: int, num_q: int) -> int:
 
 class Recovery:
     """One plan's recovery buffers, for up to `max_rows` rows and `max_kv` keys. `arena` is the call's float
-    workspace (free once the selection has run), at least RECOVERY_ROWS * max_kv floats."""
+    workspace (free once the selection has run), at least RECOVERY_ROWS * max_kv floats; when None, run() receives
+    transient `arena`, `stage_scores` and `stage_indices` from caller scratch."""
 
-    def __init__(self, max_rows: int, max_kv: int, topk: int, dtype: torch.dtype, arena: torch.Tensor):
-        dev = arena.device
-        if arena.numel() < RECOVERY_ROWS * max_kv:
-            raise ValueError("the recovery arena must hold RECOVERY_ROWS rows of dense scores")
+    def __init__(self, max_rows: int, max_kv: int, topk: int, dtype: torch.dtype,
+                 arena: Optional[torch.Tensor] = None, device: Optional[torch.device] = None):
+        if arena is not None:
+            dev = arena.device
+            if arena.numel() < RECOVERY_ROWS * max_kv:
+                raise ValueError("the recovery arena must hold RECOVERY_ROWS rows of dense scores")
+        else:
+            dev = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
         i32 = dict(dtype=torch.int32, device=dev)
         words_per_head = HEAD_DIM * torch.empty((), dtype=dtype).element_size() // 4
         self.topk = topk
@@ -63,39 +75,51 @@ class Recovery:
         self.whole_ks = torch.empty(max_rows, **i32)
         self.whole_ke = torch.empty(max_rows, **i32)
         self.scratch = torch.empty(max(max_rows, RECOVERY_ROWS), **i32)
-        self.max_splits = recovery_splits(max_kv)
-        stage_rows = RECOVERY_ROWS * self.max_splits if self.max_splits > 1 else 0
-        self.stage_scores = torch.empty(stage_rows, topk, dtype=torch.float32, device=dev)
-        self.stage_indices = torch.empty(stage_rows, topk, **i32)
+        if arena is not None:
+            self.max_splits = recovery_splits(max_kv)
+            n_stage = RECOVERY_ROWS * self.max_splits if self.max_splits > 1 else 0
+            self.stage_scores = torch.empty(n_stage, topk, dtype=torch.float32, device=dev)
+            self.stage_indices = torch.empty(n_stage, topk, **i32)
+        else:
+            self.max_splits = MAX_SPLITS
+            self.stage_scores = None
+            self.stage_indices = None
 
-    def run(self, q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices) -> None:
+    def run(self, q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices,
+            arena: Optional[torch.Tensor] = None, stage_scores: Optional[torch.Tensor] = None,
+            stage_indices: Optional[torch.Tensor] = None) -> None:
         """Enqueue the recovery of this call's selection (scores / indices, its health and bad-row table)."""
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
+        arena = self.arena if arena is None else arena
+        stage_scores = self.stage_scores if stage_scores is None else stage_scores
+        stage_indices = self.stage_indices if stage_indices is None else stage_indices
+        if arena is None or arena.numel() < RECOVERY_ROWS * seq_len_kv:
+            raise ValueError("the recovery arena must hold RECOVERY_ROWS rows of dense scores")
         sm90 = launch.arch(q) == 9
         launch.triage(health, bad_rows, ks, ke, q, weights, self.row_map, self.slot_ks, self.slot_ke, self.q_gather,
                       self.w_gather, self.whole_map[:num_q], self.whole_ks[:num_q], self.whole_ke[:num_q])
 
         # per-row: the gathered slots
-        dense = self.arena[: RECOVERY_ROWS * seq_len_kv].view(RECOVERY_ROWS, seq_len_kv)
+        dense = arena[: RECOVERY_ROWS * seq_len_kv].view(RECOVERY_ROWS, seq_len_kv)
         q_slots = self.q_gather.view(q.dtype).view(RECOVERY_ROWS, NUM_HEADS, HEAD_DIM)
         operand = launch.as_operand(q_slots).view(-1, HEAD_DIM, 1) if sm90 else None
         launch.scan_dense(q_slots, kv, kv_scales, self.w_gather, self.slot_ks, self.slot_ke, dense,
                           self.scratch[:RECOVERY_ROWS], q_operand=operand)
-        splits = min(self.max_splits, recovery_splits(seq_len_kv))
+        splits = recovery_splits(seq_len_kv) if self.arena is None else min(self.max_splits, recovery_splits(seq_len_kv))
         if splits > 1:
             stage = RECOVERY_ROWS * splits
-            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, self.stage_scores[:stage],
-                                self.stage_indices[:stage], splits)
-            launch.select_staged(self.stage_scores[:stage], self.stage_indices[:stage], self.row_map, scores, indices)
+            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, stage_scores[:stage],
+                                stage_indices[:stage], splits)
+            launch.select_staged(stage_scores[:stage], stage_indices[:stage], self.row_map, scores, indices)
         else:
             launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, scores, indices)
 
         # whole call, `chunk` rows at a time
-        chunk = dense_rows(self.arena.numel(), seq_len_kv, num_q)
+        chunk = dense_rows(arena.numel(), seq_len_kv, num_q)
         full_operand = launch.q_operand_sm90(q) if sm90 else None
         for off in range(0, num_q, chunk):
             rows = min(chunk, num_q - off)
-            dense = self.arena[: rows * seq_len_kv].view(rows, seq_len_kv)
+            dense = arena[: rows * seq_len_kv].view(rows, seq_len_kv)
             part = slice(off, off + rows)
             operand = None
             if sm90:
