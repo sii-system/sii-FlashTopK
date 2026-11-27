@@ -38,9 +38,14 @@ On a full prefill, FlashTopK is 1.7-3.3x faster than dense scoring + FlashInfer 
 FlashTopK needs Python 3.10+, PyTorch 2.6+, Triton 3.3+ and CuTe DSL (`nvidia-cutlass-dsl`) 4.5+. SM100 GPUs also need a CUDA 12.8+ driver.
 
 ```bash
-pip install -e .            # torch >= 2.6, triton >= 3.3, nvidia-cutlass-dsl >= 4.5, apache-tvm-ffi
-pip install -e .[test]      # pytest for the test suite
+# Install into an existing SGLang / PyTorch environment without overriding pinned deps:
+pip install --no-deps git+https://github.com/Frank-whw/FlashTopK.git
+
+# Or from a local checkout:
+pip install --no-deps .
 ```
+
+> **Note:** This fork packages the caller-owned-scratch FP8 `Selector` from SGLang PR #52822 (`f6c4acab9220d6b08222a0d9eaec9c869e832419`) with configurable `min_keys` pruning thresholds and the `finish` recovery/audit callback used by `sii-sglang`. See `flashtopk/UPSTREAM.json` for provenance.
 
 ### Quick start
 

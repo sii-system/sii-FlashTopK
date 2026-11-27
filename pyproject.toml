@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashtopk"
-version = "0.1.0"
-description = "Fast, exact, deterministic fused top-k selection for learned sparse attention"
+version = "0.1.0+sii1"
+description = "Fast, exact, deterministic fused FP8 top-k selection for learned sparse attention (SGLang DSA fork)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -21,6 +21,9 @@ test = ["pytest"]
 
 [tool.setuptools.packages.find]
 include = ["flashtopk*"]
+
+[tool.setuptools.package-data]
+flashtopk = ["UPSTREAM.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

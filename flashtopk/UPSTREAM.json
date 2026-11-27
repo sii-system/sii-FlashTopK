@@ -1,0 +1,32 @@
+{
+  "sglang_pr": 52822,
+  "sglang_pr_sha": "f6c4acab9220d6b08222a0d9eaec9c869e832419",
+  "flash_top_k_sha": "090902abad86e5bb3324519124a680122fff91a1",
+  "vendor_base_git_blobs": {
+    "__init__.py": "0a1e8fa8e93a5738da383f919d0453a9b92d8f28",
+    "kernels/__init__.py": "72dd56079aa6449977735e8f3a0edd45fdadc234",
+    "kernels/common.py": "6ae31fb116178e841fe9407287ccaa7dbe57e5b9",
+    "kernels/launch.py": "aacd0f3b4ca9d394ec095ad8194bb48f2b689977",
+    "kernels/prologue.py": "3fc5ac1387dac4002031336bf95f16cfdfac6bd5",
+    "kernels/prune_sm100.py": "692666a2b444de45c95f952c30e2e7036f484ce0",
+    "kernels/prune_sm90.py": "6890f708e5e9f3b2c132031a65ab733206652322",
+    "kernels/refine_sm100.py": "9846ffbba0570716e784037869c10ec5d2bcf055",
+    "kernels/refine_sm90.py": "484f5aa6b500eb15dcb7f6ecd24f13792c0309bb",
+    "kernels/scan_sm100.py": "18933c49f517e3721b933e8f27e3870a463c9e29",
+    "kernels/scan_sm90.py": "480e49c3534a35aab977d57bf5ef956beaa2c20b",
+    "kernels/seed_prep.py": "61729b8778015af8c9a763b025eea43793de6fbd",
+    "kernels/selection.py": "4b7ca1517293866ff8c042df0946b253b432cbf8",
+    "kernels/simt.py": "85e070185c04c0757402c44e81581e188234ab00",
+    "kernels/sm100_utils.py": "ab905f843e420405eaf67a3aa8fe583493aa57c6",
+    "kernels/sm90_utils.py": "8c607ebaad5c9e87d454fa77fb509fe8bb83f3a7",
+    "kernels/triage.py": "1b5e49a6ce290e9ccd70e48deb11bcdd2c61dfc5",
+    "plan.py": "2099e00487c9cbf074ab15bd5ddc09fb2540bdf9",
+    "recovery.py": "aeef0e3c27d16e2a27a7f7037cba0d656e50acc9",
+    "topk.py": "6bc8f75ce60b92c7addba36990083a5fb891988b"
+  },
+  "locally_modified": [
+    "__init__.py",
+    "plan.py",
+    "topk.py"
+  ]
+}
