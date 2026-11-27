@@ -39,7 +39,7 @@ FlashTopK needs Python 3.10+, PyTorch 2.6+, Triton 3.3+ and CuTe DSL (`nvidia-cu
 
 ```bash
 # Install into an existing SGLang / PyTorch environment without overriding pinned deps:
-pip install --no-deps git+https://github.com/Frank-whw/FlashTopK.git
+pip install --no-deps git+https://github.com/sii-system/FlashTopK.git@v0.1.0-sii1
 
 # Or from a local checkout:
 pip install --no-deps .
