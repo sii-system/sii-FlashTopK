@@ -37,7 +37,9 @@ host, both paths launch and the one not taken sees empty windows.
 from __future__ import annotations
 
 import functools
+import math
 import os
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import torch
@@ -45,7 +47,10 @@ import triton
 import triton.language as tl
 
 from .kernels import launch
+from .kernels.common import BLOCK_KV, HEAD_DIM, NEXT_N, PRUNE_BLOCK_Q, REFINE_BLOCK_Q
 from .kernels.prologue import EST_GROUP, EST_WORDS
+from .kernels.refine_sm90 import MAX_BLOCKS as REFINE_SM90_MAX_BLOCKS
+from .kernels.refine_sm100 import max_blocks as refine_max_blocks
 
 # The pruning kernels' columns per row: the retained heads and the negative aggregate's two rows.
 PRUNE_COLUMNS = 16
@@ -296,37 +301,64 @@ def _plan_sample_cols(nk: int, device_index: int) -> Tuple[torch.Tensor, torch.T
     return cols.to(torch.int32), cols
 
 
+def plan_scratch(take, num_q: int, nk: int, dtype: torch.dtype = torch.float8_e4m3fn) -> SimpleNamespace:
+    """The buffers of a plan over num_q rows and nk keys, each from take(shape, dtype): flat, q_prune padded to the
+    larger row group (SM90's 16 rows)."""
+    padded = triton.cdiv(num_q, 16) * 16
+    return SimpleNamespace(
+        q_prune=take((padded * PRUNE_COLUMNS, HEAD_DIM), dtype),
+        w_prune=take((num_q, PRUNE_COLUMNS), torch.float32),
+        allowance=take((num_q,), torch.float32),
+        est=take((estimate_rows(num_q), EST_WORDS), torch.int32),
+        # Padded to 4 floats, as the TMA of every per-key vector reads.
+        knsc=take(((nk + 3) // 4 * 4,), torch.float32),
+        knsc_samples=take((_PLAN_SAMPLES,), torch.float32),
+    )
+
+
 class _Plan:
     """Buffers and sample keys of one call's pruning plan."""
 
-    def __init__(self, q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket):
+    def __init__(self, q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, scratch=None):
         num_q, heads, dim = q.shape
         nk = kv.shape[0]
         dev = q.device
         self.layout = 2 if torch.cuda.get_device_capability(dev)[0] == 9 else 1
         group = 16 if self.layout == 2 else 2
         self.padded = triton.cdiv(num_q, group) * group
-        self.q_prune = torch.empty(self.padded * PRUNE_COLUMNS, dim, dtype=q.dtype, device=dev)
-        self.w_prune = torch.empty(num_q, PRUNE_COLUMNS, dtype=torch.float32, device=dev)
-        self.allowance = torch.empty(num_q, dtype=torch.float32, device=dev)
-        self.est_rows = estimate_rows(num_q)
-        self.est = torch.empty(self.est_rows, EST_WORDS, dtype=torch.int32, device=dev)
+        if scratch is not None:
+            self.q_prune = scratch.q_prune[: self.padded * PRUNE_COLUMNS]
+            self.w_prune = scratch.w_prune
+            self.allowance = scratch.allowance
+            self.est_rows = estimate_rows(num_q)
+            self.est = scratch.est
+            self.knsc = scratch.knsc
+        else:
+            self.q_prune = torch.empty(self.padded * PRUNE_COLUMNS, dim, dtype=q.dtype, device=dev)
+            self.w_prune = torch.empty(num_q, PRUNE_COLUMNS, dtype=torch.float32, device=dev)
+            self.allowance = torch.empty(num_q, dtype=torch.float32, device=dev)
+            self.est_rows = estimate_rows(num_q)
+            self.est = torch.empty(self.est_rows, EST_WORDS, dtype=torch.int32, device=dev)
+            # Padded to 4 floats, as the TMA of every per-key vector reads.
+            self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
         if th_bucket is None:
             origin = torch.zeros(num_q, dtype=torch.float32, device=dev)
             inv_delta = torch.zeros(num_q, dtype=torch.float32, device=dev)
             th_bucket = torch.zeros(num_q, dtype=torch.int32, device=dev)
-        # Padded to 4 floats, as the TMA of every per-key vector reads.
-        self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
         self.cols, picked = _plan_sample_cols(nk, dev.index)
-        self.k_samples = kv[picked].contiguous()
         self.bf16 = kv_scales is None
         if self.bf16:
+            self.k_samples = kv[picked].contiguous()
             self.s_samples = torch.ones(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
         else:
+            self.k_samples = kv.view(torch.uint8).index_select(0, picked).view(kv.dtype)
             self.s_samples = kv_scales.reshape(-1)[picked].float().contiguous()
         # The samples' scale * ||k||, by the kernel and arithmetic of the full table (knsc[picked]). The samples are
         # gathered once here: a plan kernel reading them from their scattered rows took a fifth longer on SM90.
-        self.knsc_samples = torch.empty(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
+        self.knsc_samples = (
+            scratch.knsc_samples if scratch is not None
+            else torch.empty(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
+        )
         _key_norm_kernel[(triton.cdiv(_PLAN_SAMPLES, 64),)](
             self.k_samples, self.s_samples, self.knsc_samples, _PLAN_SAMPLES, _PLAN_SAMPLES, self.knsc_samples,
             BLOCK=64, GATED=False, HAS_SCALES=not self.bf16,
@@ -425,23 +457,44 @@ def prune_costs(device_index: int, bf16: bool) -> Tuple[float, float, float]:
 
 
 @functools.lru_cache(maxsize=4096)
-def adaptive_threshold(device_index: int, bf16: bool, seq_len_kv: int) -> float:
-    """The group estimate at or below which a call prunes: where pruning's predicted cost meets the scan's,
-    p * 128K / L + c + b * U = 1."""
+def adaptive_threshold(device_index: int, bf16: bool, seq_len_kv: int,
+                       num_q: Optional[int] = None, min_keys: Optional[int] = None) -> float:
+    """The group estimate at or below which a call prunes: where pruning's predicted cost meets the scan's.
+    With num_q given, accounts for each stage's CTA wave count."""
+    if min_keys is not None and (seq_len_kv < min_keys or (num_q is not None and num_q <= 0)):
+        return 0.0
     p, c, b = prune_costs(device_index, bf16)
-    return min(max((1.0 - p * 131072 / seq_len_kv - c) / b, 0.0), 1.0)
+    if num_q is None:
+        return min(max((1.0 - p * 131072 / seq_len_kv - c) / b, 0.0), 1.0)
+    if num_q <= 0:
+        return 0.0
+    sms = launch.sm_count(device_index)
+    ss = launch.scan_kv_splits(num_q, seq_len_kv, sms)
+    ws = math.ceil(math.ceil(num_q / NEXT_N) * ss / sms)
+    ps = launch.prune_kv_splits(num_q, seq_len_kv, PRUNE_BLOCK_Q, 1, sms)
+    wp = math.ceil(math.ceil(num_q / PRUNE_BLOCK_Q) * ps / sms)
+    mask_blocks = math.ceil(seq_len_kv / BLOCK_KV)
+    max_blks = (REFINE_SM90_MAX_BLOCKS if torch.cuda.get_device_capability(device_index)[0] == 9
+                else refine_max_blocks(bf16))
+    rs = launch.prune_kv_splits(num_q, seq_len_kv, REFINE_BLOCK_Q, math.ceil(mask_blocks / max_blks), sms)
+    wr = math.ceil(math.ceil(num_q / REFINE_BLOCK_Q) * rs / sms)
+    rp = max(1.0, 2.0 * (wp * ss) / (ws * ps))
+    rr = max(1.0, (wr * ss) / (ws * rs))
+    rplan = max(1.0, (math.ceil(num_q / sms) * ss) / (8.0 * ws))
+    return min(max((1.0 - p * rplan * 131072 / seq_len_kv - c * rp) / (b * rr), 0.0), 1.0)
 
 
 def adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, flag, scan_ks, prune_ks,
-                      estimate=None):
+                      estimate=None, threshold: Optional[float] = None, scratch=None):
     """The plan of the estimate groups' rows, then the GPU's choice: ``flag`` (int32[1]) set when this call's group
     estimate is at or below ``adaptive_threshold``, ``scan_ks`` / ``prune_ks`` the windows' starts for the scan and
     for the pruning kernels (the row's own on the path chosen, past its end on the other); ``estimate`` (FP32[1]),
     when given, receives the estimate. Returns the plan, which ``adaptive_finish`` completes."""
     num_q = q.shape[0]
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket)
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, scratch=scratch)
     plan.rows(num_q, True, None)
-    threshold = adaptive_threshold(q.device.index, kv_scales is None, kv.shape[0])
+    if threshold is None:
+        threshold = adaptive_threshold(q.device.index, kv_scales is None, kv.shape[0])
     launch.decide(plan.est, ks, ke, scan_ks, prune_ks, flag, threshold, estimate)
     return plan
 
@@ -455,7 +508,7 @@ def adaptive_finish(plan, kv, flag):
 
 
 @torch.no_grad()
-def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None, th_bucket=None):
+def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None, th_bucket=None, scratch=None):
     """``(q_prune, w_prune, allowance, knsc, est)`` for every row: the always-prune plan.
 
     ``q_prune`` (FP8 or BF16): per row the retained heads' rows of ``q``, then the aggregate's high and low rows, laid
@@ -465,7 +518,7 @@ def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None
     sample masks (``estimate_shares``).
     """
     num_q = q.shape[0]
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket)
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, scratch=scratch)
     key_norms(plan, kv)
     plan.rows(num_q, False, None)
     return plan.operands()
